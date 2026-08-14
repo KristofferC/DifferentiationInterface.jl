@@ -459,7 +459,7 @@ function _gradient_and_hvp_aux!(
         tx::NTuple,
         contexts::Vararg{Context, C},
     ) where {F, C}
-    (; maybe_inner_gradient_in_prep, outer_pushforward_in_prep) = prep
+    (; grad_buffer, maybe_inner_gradient_in_prep, outer_pushforward_in_prep) = prep
     rewrap = Rewrap(contexts...)
     new_contexts = (
         FunctionContext(f),
@@ -468,9 +468,11 @@ function _gradient_and_hvp_aux!(
         Constant(rewrap),
         contexts...,
     )
+    # the pushforward prep was built with grad_buffer as the primal output, so
+    # writing into grad directly would put typeof(grad) in the prep signature
     value_and_pushforward!(
         shuffled_gradient!,
-        grad,
+        grad_buffer,
         tg,
         outer_pushforward_in_prep,
         outer(backend),
@@ -478,7 +480,7 @@ function _gradient_and_hvp_aux!(
         tx,
         new_contexts...,
     )
-    return grad, tg
+    return copyto!(grad, grad_buffer), tg
 end
 
 function _gradient_and_hvp_aux!(
@@ -808,14 +810,16 @@ function _gradient_and_hvp_aux!(
         tx::NTuple,
         contexts::Vararg{Context, C},
     ) where {F, C}
-    (; outer_pullback_in_prep) = prep
+    (; grad_buffer, outer_pullback_in_prep) = prep
     rewrap = Rewrap(contexts...)
     new_contexts = (
         FunctionContext(f), Constant(inner(backend)), Constant(rewrap), contexts...,
     )
-    new_grad, _ = value_and_pullback!(
+    # the pullback prep was built with grad_buffer as the primal output, so
+    # writing into grad directly would put typeof(grad) in the prep signature
+    value_and_pullback!(
         shuffled_gradient!,
-        grad,
+        grad_buffer,
         tg,
         outer_pullback_in_prep,
         outer(backend),
@@ -823,7 +827,7 @@ function _gradient_and_hvp_aux!(
         tx,
         new_contexts...,
     )
-    return grad, tg
+    return copyto!(grad, grad_buffer), tg
 end
 
 function _gradient_and_hvp_aux!(

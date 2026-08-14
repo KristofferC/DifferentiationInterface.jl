@@ -8,7 +8,7 @@ struct SMCSparseHessianPrep{
         S <: AbstractVector{<:NTuple},
         R <: AbstractVector{<:NTuple},
         E2 <: DI.HVPPrep,
-        E1 <: DI.GradientPrep,
+        DR <: Union{Nothing, NTuple},
     } <: DI.SparseHessianPrep{SIG}
     _sig::Val{SIG}
     batch_size_settings::BS
@@ -19,7 +19,10 @@ struct SMCSparseHessianPrep{
     batched_seeds::S
     batched_results::R
     hvp_prep::E2
-    gradient_prep::E1
+    # throwaway HVP buffers, only present for an all-zero sparsity pattern:
+    # no HVP batch ever runs there, so the gradient must be extracted with a
+    # dedicated gradient_and_hvp! call (HVP-only backends have no gradient)
+    degenerate_results::DR
 end
 
 ## Hessian, one argument
@@ -71,9 +74,7 @@ function _prepare_sparse_hessian_aux(
     hvp_prep = DI.prepare_hvp_nokwarg(
         strict, f, dense_backend, x, batched_seed_prep, contexts...
     )
-    gradient_prep = DI.prepare_gradient_nokwarg(
-        strict, f, DI.inner(dense_backend), x, contexts...
-    )
+    degenerate_results = isempty(groups) ? ntuple(b -> similar(x), Val(B)) : nothing
     return SMCSparseHessianPrep(
         _sig,
         batch_size_settings,
@@ -84,19 +85,19 @@ function _prepare_sparse_hessian_aux(
         batched_seeds,
         batched_results,
         hvp_prep,
-        gradient_prep,
+        degenerate_results,
     )
 end
 
-function DI.hessian!(
+function _sparse_hessian_aux!(
         f::F,
+        grad,
         hess,
         prep::SMCSparseHessianPrep{SIG, <:DI.BatchSizeSettings{B}},
         backend::AutoSparse,
         x,
         contexts::Vararg{DI.Context, C},
     ) where {F, SIG, B, C}
-    DI.check_prep(f, prep, backend, x, contexts...)
     (;
         batch_size_settings,
         coloring_result,
@@ -114,15 +115,12 @@ function DI.hessian!(
     )
 
     for a in eachindex(batched_seeds, batched_results)
-        DI.hvp!(
-            f,
-            batched_results[a],
-            hvp_prep_same,
-            dense_backend,
-            x,
-            batched_seeds[a],
-            contexts...,
-        )
+        hvp_args = (batched_results[a], hvp_prep_same, dense_backend, x, batched_seeds[a])
+        if !isnothing(grad) && a == firstindex(batched_seeds)
+            DI.gradient_and_hvp!(f, grad, hvp_args..., contexts...)
+        else
+            DI.hvp!(f, hvp_args..., contexts...)
+        end
 
         for b in eachindex(batched_results[a])
             copyto!(
@@ -132,8 +130,36 @@ function DI.hessian!(
         end
     end
 
+    if !isnothing(grad) && !isnothing(prep.degenerate_results)
+        # Degenerate all-zero sparsity pattern: the loop above never ran, so
+        # extract the gradient with a throwaway HVP on the preparation seeds
+        # (a first-order gradient prep would not work for HVP-only backends).
+        DI.gradient_and_hvp!(
+            f,
+            grad,
+            prep.degenerate_results,
+            hvp_prep_same,
+            dense_backend,
+            x,
+            batched_seed_prep,
+            contexts...,
+        )
+    end
+
     decompress!(hess, compressed_matrix, coloring_result)
     return hess
+end
+
+function DI.hessian!(
+        f::F,
+        hess,
+        prep::SMCSparseHessianPrep,
+        backend::AutoSparse,
+        x,
+        contexts::Vararg{DI.Context, C},
+    ) where {F, C}
+    DI.check_prep(f, prep, backend, x, contexts...)
+    return _sparse_hessian_aux!(f, nothing, hess, prep, backend, x, contexts...)
 end
 
 function DI.hessian(
@@ -154,10 +180,10 @@ function DI.value_gradient_and_hessian!(
         contexts::Vararg{DI.Context, C},
     ) where {F, C}
     DI.check_prep(f, prep, backend, x, contexts...)
-    y, _ = DI.value_and_gradient!(
-        f, grad, prep.gradient_prep, DI.inner(dense_ad(backend)), x, contexts...
-    )
-    DI.hessian!(f, hess, prep, backend, x, contexts...)
+    # there is no fused value_gradient_and_hvp operator, so the primal value
+    # costs one extra call to f here
+    y = f(x, map(DI.unwrap, contexts)...)
+    _sparse_hessian_aux!(f, grad, hess, prep, backend, x, contexts...)
     return y, grad, hess
 end
 
@@ -165,9 +191,17 @@ function DI.value_gradient_and_hessian(
         f::F, prep::SMCSparseHessianPrep, backend::AutoSparse, x, contexts::Vararg{DI.Context, C}
     ) where {F, C}
     DI.check_prep(f, prep, backend, x, contexts...)
-    y, grad = DI.value_and_gradient(
-        f, prep.gradient_prep, DI.inner(dense_ad(backend)), x, contexts...
+    grad_buffer = similar(x)
+    hess = similar(sparsity_pattern(prep), eltype(x))
+    y, _, _ = DI.value_gradient_and_hessian!(
+        f, grad_buffer, hess, prep, backend, x, contexts...
     )
-    hess = DI.hessian(f, prep, backend, x, contexts...)
+    grad = if DI.ismutable_array(x)
+        grad_buffer
+    else
+        # the fused path needs a mutable buffer, but the gradient returned to
+        # the caller should live in the same vector space as x (e.g. SArray)
+        map(+, zero(x), grad_buffer)
+    end
     return y, grad, hess
 end
